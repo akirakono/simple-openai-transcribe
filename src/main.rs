@@ -2,7 +2,9 @@ mod app;
 mod audio;
 mod config;
 mod env;
+mod history;
 mod ipc;
+mod logging;
 mod openai;
 
 use std::process::{Command as ProcessCommand, Stdio};
@@ -29,14 +31,7 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "simple_openai_transcribe=info".into()),
-        )
-        .with_target(false)
-        .compact()
-        .init();
+    logging::init_logging()?;
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Daemon);

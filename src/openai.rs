@@ -21,6 +21,7 @@ const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 pub struct SessionOptions {
     pub api_key: String,
     pub terms: Vec<String>,
+    pub transcription_prompt: String,
     pub vad_threshold: f32,
     pub vad_silence_ms: u32,
 }
@@ -39,11 +40,17 @@ pub enum UiEvent {
     CorrectionTimerElapsed(u64),
     CorrectionReady(CorrectionResult),
     CorrectionFailed(u64),
-    TranslationReady(String),
-    TranslationStarted,
+    TranslationReady(TranslationTarget, String),
+    TranslationStarted(TranslationTarget),
     RecordingStarted(mpsc::UnboundedSender<SessionCommand>),
     RecordingFinished,
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationTarget {
+    Japanese,
+    English,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +99,7 @@ async fn run_transcription(
         .context("failed to connect to OpenAI Realtime API")?;
     let (mut write, mut read) = ws_stream.split();
 
-    let prompt = build_transcription_prompt(&options.terms);
+    let prompt = build_transcription_prompt(&options.transcription_prompt, &options.terms);
     let threshold = normalize_vad_threshold(options.vad_threshold);
     let session_update = json!({
         "type": "transcription_session.update",
@@ -290,7 +297,7 @@ fn event_type(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub async fn translate_text(api_key: &str, text: &str) -> Result<String> {
+pub async fn translate_text(api_key: &str, text: &str, instructions: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let response = client
         .post(RESPONSES_URL)
@@ -298,7 +305,7 @@ pub async fn translate_text(api_key: &str, text: &str) -> Result<String> {
         .header(CONTENT_TYPE, "application/json")
         .json(&json!({
             "model": "gpt-4.1-nano",
-            "instructions": "Translate the user's Japanese transcript into natural English. Preserve meaning. Output only the translation.",
+            "instructions": instructions,
             "input": text,
         }))
         .send()
@@ -376,14 +383,20 @@ fn extract_output_text(value: &Value) -> Option<String> {
     }
 }
 
-pub fn build_transcription_prompt(terms: &[String]) -> String {
-    if terms.is_empty() {
-        return "日本語の音声を自然な表記で正確に文字起こししてください。".to_string();
+pub fn build_transcription_prompt(base_prompt: &str, terms: &[String]) -> String {
+    let mut prompt = base_prompt.trim().to_string();
+    if prompt.is_empty() {
+        prompt = "日本語の音声を自然な表記で正確に文字起こししてください。".to_string();
     }
 
-    let mut prompt = String::from(
-        "日本語の音声を自然な表記で正確に文字起こししてください。以下の語を優先して正確に認識してください:\n",
-    );
+    if terms.is_empty() {
+        return prompt;
+    }
+
+    if !prompt.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("以下の語を優先して正確に認識してください:\n");
     for term in terms {
         prompt.push_str("- ");
         prompt.push_str(term);
@@ -543,7 +556,10 @@ mod tests {
 
     #[test]
     fn prompt_includes_terms() {
-        let prompt = build_transcription_prompt(&["OpenAI".to_string(), "Ubuntu".to_string()]);
+        let prompt = build_transcription_prompt(
+            "日本語の音声を自然な表記で正確に文字起こししてください。",
+            &["OpenAI".to_string(), "Ubuntu".to_string()],
+        );
         assert!(prompt.contains("OpenAI"));
         assert!(prompt.contains("Ubuntu"));
     }

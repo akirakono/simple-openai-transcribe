@@ -12,6 +12,9 @@ pub struct AppConfig {
     pub vad_silence_ms: u32,
     pub copy_on_finish: bool,
     pub auto_show_on_start: bool,
+    pub transcription_system_prompt: String,
+    pub translate_to_english_prompt: String,
+    pub translate_to_japanese_prompt: String,
     pub window_width: i32,
     pub window_height: i32,
 }
@@ -24,6 +27,14 @@ impl Default for AppConfig {
             vad_silence_ms: 900,
             copy_on_finish: true,
             auto_show_on_start: true,
+            transcription_system_prompt:
+                "日本語の音声を自然な表記で正確に文字起こししてください。".to_string(),
+            translate_to_english_prompt:
+                "Translate the user's Japanese text into natural English. Preserve meaning. Output only the translation."
+                    .to_string(),
+            translate_to_japanese_prompt:
+                "Translate the user's English text into natural Japanese. Preserve meaning. Output only the translation."
+                    .to_string(),
             window_width: 1100,
             window_height: 760,
         }
