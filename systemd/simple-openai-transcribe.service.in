@@ -1,0 +1,14 @@
+[Unit]
+Description=Simple OpenAI Transcribe daemon
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKDIR@
+ExecStart=@EXECSTART@ daemon
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target
