@@ -116,7 +116,6 @@ struct UiState {
     last_transcription_activity: Option<Instant>,
     last_local_speech_activity: Option<Instant>,
     waiting_for_transcription_since: Option<Instant>,
-    awaiting_transcription_after_local_speech: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -263,7 +262,6 @@ impl Ui {
             last_transcription_activity: None,
             last_local_speech_activity: None,
             waiting_for_transcription_since: None,
-            awaiting_transcription_after_local_speech: false,
         }));
 
         Self::install_actions(app, &window, &state);
@@ -426,9 +424,7 @@ impl Ui {
                             state.active_session = None;
                             state.finish_requested = false;
                             state.last_transcription_activity = None;
-                            state.last_local_speech_activity = None;
-                            state.waiting_for_transcription_since = None;
-                            state.awaiting_transcription_after_local_speech = false;
+                            state.reset_local_speech_state();
                             state.set_recording_active(false);
                             state.set_status("待機中", false);
                             state.persist_transcription_history();
@@ -554,9 +550,7 @@ impl Ui {
         state_mut.latest_recording_history = None;
         state_mut.finish_requested = false;
         state_mut.last_transcription_activity = Some(Instant::now());
-        state_mut.last_local_speech_activity = None;
-        state_mut.waiting_for_transcription_since = None;
-        state_mut.awaiting_transcription_after_local_speech = false;
+        state_mut.reset_local_speech_state();
         state_mut.active_recording_history = Some(RecordingHistoryContext {
             transcript_before: buffer_text(&state_mut.transcript_buffer),
         });
@@ -1113,23 +1107,25 @@ impl UiState {
 
     fn touch_transcription_activity(&mut self) {
         self.last_transcription_activity = Some(Instant::now());
-        self.waiting_for_transcription_since = None;
-        self.awaiting_transcription_after_local_speech = false;
+        self.reset_local_speech_state();
     }
 
     fn touch_local_speech_activity(&mut self) {
         let now = Instant::now();
         self.last_local_speech_activity = Some(now);
-        if !self.awaiting_transcription_after_local_speech {
+        if self.waiting_for_transcription_since.is_none() {
             self.waiting_for_transcription_since = Some(now);
         }
-        self.awaiting_transcription_after_local_speech = true;
+    }
+
+    fn reset_local_speech_state(&mut self) {
+        self.last_local_speech_activity = None;
+        self.waiting_for_transcription_since = None;
     }
 
     fn should_auto_finish(&self) -> bool {
         should_auto_finish(
             self.last_transcription_activity,
-            self.awaiting_transcription_after_local_speech,
             self.last_local_speech_activity,
             self.waiting_for_transcription_since,
         )
@@ -1384,17 +1380,14 @@ fn transcript_delta(before: &str, after: &str) -> String {
 
 fn should_auto_finish(
     last_transcription_activity: Option<Instant>,
-    awaiting_transcription_after_local_speech: bool,
     last_local_speech_activity: Option<Instant>,
     waiting_for_transcription_since: Option<Instant>,
 ) -> bool {
-    if awaiting_transcription_after_local_speech {
+    if let Some(since) = waiting_for_transcription_since {
         let local_speech_active = last_local_speech_activity
             .is_some_and(|instant| instant.elapsed() < LOCAL_SPEECH_ACTIVE_GRACE);
         if local_speech_active {
-            return waiting_for_transcription_since.is_some_and(|instant| {
-                instant.elapsed() >= AUTO_FINISH_WAITING_FOR_TRANSCRIPTION
-            });
+            return since.elapsed() >= AUTO_FINISH_WAITING_FOR_TRANSCRIPTION;
         }
     }
 
@@ -1475,7 +1468,6 @@ mod tests {
     fn auto_finish_waits_for_transcription_after_local_speech() {
         assert!(!should_auto_finish(
             Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
-            true,
             Some(Instant::now()),
             Some(Instant::now() - Duration::from_secs(5)),
         ));
@@ -1485,7 +1477,6 @@ mod tests {
     fn auto_finish_falls_back_after_long_wait_for_missing_transcription() {
         assert!(should_auto_finish(
             Some(Instant::now()),
-            true,
             Some(Instant::now()),
             Some(Instant::now() - AUTO_FINISH_WAITING_FOR_TRANSCRIPTION - Duration::from_secs(1)),
         ));
@@ -1495,7 +1486,6 @@ mod tests {
     fn auto_finish_falls_back_to_ten_second_timer_after_local_speech_stops() {
         assert!(should_auto_finish(
             Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
-            true,
             Some(Instant::now() - LOCAL_SPEECH_ACTIVE_GRACE - Duration::from_millis(1)),
             Some(Instant::now() - Duration::from_secs(5)),
         ));
@@ -1505,7 +1495,6 @@ mod tests {
     fn auto_finish_after_ten_seconds_without_pending_local_speech() {
         assert!(should_auto_finish(
             Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
-            false,
             None,
             None,
         ));
