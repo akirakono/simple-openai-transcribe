@@ -1391,8 +1391,14 @@ fn should_auto_finish(
         }
     }
 
-    last_transcription_activity
-        .is_some_and(|instant| instant.elapsed() >= AUTO_FINISH_AFTER_TRANSCRIPTION)
+    let last_activity = match (last_transcription_activity, last_local_speech_activity) {
+        (Some(transcription), Some(local_speech)) => Some(transcription.max(local_speech)),
+        (Some(transcription), None) => Some(transcription),
+        (None, Some(local_speech)) => Some(local_speech),
+        (None, None) => None,
+    };
+
+    last_activity.is_some_and(|instant| instant.elapsed() >= AUTO_FINISH_AFTER_TRANSCRIPTION)
 }
 
 fn history_entry_title(entry: &HistoryEntry) -> String {
@@ -1483,8 +1489,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_finish_falls_back_to_ten_second_timer_after_local_speech_stops() {
-        assert!(should_auto_finish(
+    fn auto_finish_waits_for_latest_local_speech_after_local_speech_stops() {
+        assert!(!should_auto_finish(
             Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
             Some(Instant::now() - LOCAL_SPEECH_ACTIVE_GRACE - Duration::from_millis(1)),
             Some(Instant::now() - Duration::from_secs(5)),
@@ -1497,6 +1503,20 @@ mod tests {
             Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
             None,
             None,
+        ));
+    }
+
+    #[test]
+    fn auto_finish_after_ten_seconds_from_latest_local_speech() {
+        assert!(should_auto_finish(
+            Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(12)),
+            Some(
+                Instant::now()
+                    - LOCAL_SPEECH_ACTIVE_GRACE
+                    - AUTO_FINISH_AFTER_TRANSCRIPTION
+                    - Duration::from_millis(1),
+            ),
+            Some(Instant::now() - Duration::from_secs(5)),
         ));
     }
 }
