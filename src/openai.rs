@@ -17,6 +17,10 @@ use crate::audio;
 
 const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+const LOCAL_SPEECH_SIGNAL_INTERVAL: Duration = Duration::from_millis(250);
+const LOCAL_SPEECH_RMS_THRESHOLD: f64 = 0.015;
+const LOCAL_SPEECH_PEAK_THRESHOLD: f64 = 0.08;
+
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
     pub api_key: String,
@@ -36,6 +40,7 @@ pub enum SessionCommand {
 pub enum UiEvent {
     Status(String),
     Preview(String),
+    LocalSpeechDetected,
     AppendCommitted(String),
     CorrectionTimerElapsed(u64),
     CorrectionReady(CorrectionResult),
@@ -131,6 +136,7 @@ async fn run_transcription(
     let _ = ui_tx.send(UiEvent::Status("録音中".to_string()));
     let mut assembler = TranscriptAssembler::default();
     let mut pending_audio_bytes = 0_usize;
+    let mut last_local_speech_signal = None;
 
     let mut finish_deadline: Option<Instant> = None;
 
@@ -161,6 +167,11 @@ async fn run_transcription(
             }
             Some(chunk) = audio_rx.recv(), if finish_deadline.is_none() => {
                 pending_audio_bytes += chunk.len();
+                if chunk_has_local_speech(&chunk)
+                    && should_emit_local_speech_signal(&mut last_local_speech_signal)
+                {
+                    let _ = ui_tx.send(UiEvent::LocalSpeechDetected);
+                }
                 let append = json!({
                     "type": "input_audio_buffer.append",
                     "audio": base64::engine::general_purpose::STANDARD.encode(chunk),
@@ -295,6 +306,38 @@ fn event_type(text: &str) -> Option<String> {
         .get("type")?
         .as_str()
         .map(str::to_string)
+}
+
+fn should_emit_local_speech_signal(last_signal: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    if last_signal.is_some_and(|instant| now.duration_since(instant) < LOCAL_SPEECH_SIGNAL_INTERVAL)
+    {
+        return false;
+    }
+
+    *last_signal = Some(now);
+    true
+}
+
+fn chunk_has_local_speech(chunk: &[u8]) -> bool {
+    let mut sum_squares = 0.0_f64;
+    let mut sample_count = 0_u32;
+    let mut peak = 0.0_f64;
+
+    for sample in chunk.chunks_exact(2) {
+        let value = i16::from_le_bytes([sample[0], sample[1]]) as f64 / i16::MAX as f64;
+        let abs = value.abs();
+        peak = peak.max(abs);
+        sum_squares += value * value;
+        sample_count += 1;
+    }
+
+    if sample_count == 0 {
+        return false;
+    }
+
+    let rms = (sum_squares / sample_count as f64).sqrt();
+    rms >= LOCAL_SPEECH_RMS_THRESHOLD || peak >= LOCAL_SPEECH_PEAK_THRESHOLD
 }
 
 pub async fn translate_text(api_key: &str, text: &str, instructions: &str) -> Result<String> {
@@ -607,5 +650,19 @@ mod tests {
             event_type(r#"{"type":"input_audio_buffer.committed","item_id":"x"}"#),
             Some("input_audio_buffer.committed".to_string())
         );
+    }
+
+    #[test]
+    fn local_speech_detector_ignores_silence() {
+        assert!(!chunk_has_local_speech(&[0; 960]));
+    }
+
+    #[test]
+    fn local_speech_detector_finds_voice_like_energy() {
+        let mut chunk = Vec::with_capacity(960);
+        for _ in 0..480 {
+            chunk.extend_from_slice(&1200_i16.to_le_bytes());
+        }
+        assert!(chunk_has_local_speech(&chunk));
     }
 }

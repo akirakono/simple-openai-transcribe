@@ -18,6 +18,10 @@ use crate::openai::{
     self, CorrectionResult, SessionCommand, SessionOptions, TranslationTarget, UiEvent,
 };
 
+const AUTO_FINISH_AFTER_TRANSCRIPTION: Duration = Duration::from_secs(10);
+const AUTO_FINISH_WAITING_FOR_TRANSCRIPTION: Duration = Duration::from_secs(60);
+const LOCAL_SPEECH_ACTIVE_GRACE: Duration = Duration::from_secs(1);
+
 pub fn run_daemon() -> Result<()> {
     let store = ConfigStore::new()?;
     let history_store = HistoryStore::new()?;
@@ -110,6 +114,9 @@ struct UiState {
     latest_recording_history: Option<FinishedRecordingHistory>,
     finish_requested: bool,
     last_transcription_activity: Option<Instant>,
+    last_local_speech_activity: Option<Instant>,
+    waiting_for_transcription_since: Option<Instant>,
+    awaiting_transcription_after_local_speech: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +261,9 @@ impl Ui {
             latest_recording_history: None,
             finish_requested: false,
             last_transcription_activity: None,
+            last_local_speech_activity: None,
+            waiting_for_transcription_since: None,
+            awaiting_transcription_after_local_speech: false,
         }));
 
         Self::install_actions(app, &window, &state);
@@ -343,9 +353,7 @@ impl Ui {
                     let state = state.borrow();
                     state.active_session.is_some()
                         && !state.finish_requested
-                        && state
-                            .last_transcription_activity
-                            .is_some_and(|instant| instant.elapsed() >= Duration::from_secs(10))
+                        && state.should_auto_finish()
                 };
                 if should_finish {
                     Ui::finish_transcription(&state);
@@ -373,6 +381,9 @@ impl Ui {
                                 state.touch_transcription_activity();
                             }
                             state.borrow().preview_buffer.set_text(&text);
+                        }
+                        UiEvent::LocalSpeechDetected => {
+                            state.borrow_mut().touch_local_speech_activity();
                         }
                         UiEvent::AppendCommitted(text) => {
                             let buffer = state.borrow().transcript_buffer.clone();
@@ -415,6 +426,9 @@ impl Ui {
                             state.active_session = None;
                             state.finish_requested = false;
                             state.last_transcription_activity = None;
+                            state.last_local_speech_activity = None;
+                            state.waiting_for_transcription_since = None;
+                            state.awaiting_transcription_after_local_speech = false;
                             state.set_recording_active(false);
                             state.set_status("待機中", false);
                             state.persist_transcription_history();
@@ -540,6 +554,9 @@ impl Ui {
         state_mut.latest_recording_history = None;
         state_mut.finish_requested = false;
         state_mut.last_transcription_activity = Some(Instant::now());
+        state_mut.last_local_speech_activity = None;
+        state_mut.waiting_for_transcription_since = None;
+        state_mut.awaiting_transcription_after_local_speech = false;
         state_mut.active_recording_history = Some(RecordingHistoryContext {
             transcript_before: buffer_text(&state_mut.transcript_buffer),
         });
@@ -1096,6 +1113,26 @@ impl UiState {
 
     fn touch_transcription_activity(&mut self) {
         self.last_transcription_activity = Some(Instant::now());
+        self.waiting_for_transcription_since = None;
+        self.awaiting_transcription_after_local_speech = false;
+    }
+
+    fn touch_local_speech_activity(&mut self) {
+        let now = Instant::now();
+        self.last_local_speech_activity = Some(now);
+        if !self.awaiting_transcription_after_local_speech {
+            self.waiting_for_transcription_since = Some(now);
+        }
+        self.awaiting_transcription_after_local_speech = true;
+    }
+
+    fn should_auto_finish(&self) -> bool {
+        should_auto_finish(
+            self.last_transcription_activity,
+            self.awaiting_transcription_after_local_speech,
+            self.last_local_speech_activity,
+            self.waiting_for_transcription_since,
+        )
     }
 
     fn persist_transcription_history(&mut self) {
@@ -1345,6 +1382,26 @@ fn transcript_delta(before: &str, after: &str) -> String {
     after.to_string()
 }
 
+fn should_auto_finish(
+    last_transcription_activity: Option<Instant>,
+    awaiting_transcription_after_local_speech: bool,
+    last_local_speech_activity: Option<Instant>,
+    waiting_for_transcription_since: Option<Instant>,
+) -> bool {
+    if awaiting_transcription_after_local_speech {
+        let local_speech_active = last_local_speech_activity
+            .is_some_and(|instant| instant.elapsed() < LOCAL_SPEECH_ACTIVE_GRACE);
+        if local_speech_active {
+            return waiting_for_transcription_since.is_some_and(|instant| {
+                instant.elapsed() >= AUTO_FINISH_WAITING_FOR_TRANSCRIPTION
+            });
+        }
+    }
+
+    last_transcription_activity
+        .is_some_and(|instant| instant.elapsed() >= AUTO_FINISH_AFTER_TRANSCRIPTION)
+}
+
 fn history_entry_title(entry: &HistoryEntry) -> String {
     let base = match entry.kind {
         HistoryKind::Transcription => entry.source_text.as_str(),
@@ -1412,5 +1469,45 @@ mod tests {
     #[test]
     fn transcript_delta_falls_back_to_full_text_when_prefix_differs() {
         assert_eq!(transcript_delta("hello", "world"), "world".to_string());
+    }
+
+    #[test]
+    fn auto_finish_waits_for_transcription_after_local_speech() {
+        assert!(!should_auto_finish(
+            Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
+            true,
+            Some(Instant::now()),
+            Some(Instant::now() - Duration::from_secs(5)),
+        ));
+    }
+
+    #[test]
+    fn auto_finish_falls_back_after_long_wait_for_missing_transcription() {
+        assert!(should_auto_finish(
+            Some(Instant::now()),
+            true,
+            Some(Instant::now()),
+            Some(Instant::now() - AUTO_FINISH_WAITING_FOR_TRANSCRIPTION - Duration::from_secs(1)),
+        ));
+    }
+
+    #[test]
+    fn auto_finish_falls_back_to_ten_second_timer_after_local_speech_stops() {
+        assert!(should_auto_finish(
+            Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
+            true,
+            Some(Instant::now() - LOCAL_SPEECH_ACTIVE_GRACE - Duration::from_millis(1)),
+            Some(Instant::now() - Duration::from_secs(5)),
+        ));
+    }
+
+    #[test]
+    fn auto_finish_after_ten_seconds_without_pending_local_speech() {
+        assert!(should_auto_finish(
+            Some(Instant::now() - AUTO_FINISH_AFTER_TRANSCRIPTION - Duration::from_secs(1)),
+            false,
+            None,
+            None,
+        ));
     }
 }
