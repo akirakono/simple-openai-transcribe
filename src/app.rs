@@ -756,7 +756,7 @@ impl Ui {
     }
 
     fn run_correction_if_due(state: &Rc<RefCell<UiState>>, generation: u64) {
-        let (api_key, terms, original, snapshot, ui_tx, runtime) = {
+        let (api_key, terms, snapshot, ui_tx, runtime) = {
             let mut state = state.borrow_mut();
             if generation != state.correction_generation
                 || state.correction_in_flight
@@ -769,7 +769,6 @@ impl Ui {
             (
                 state.api_key.clone(),
                 state.config.terms.clone(),
-                state.pending_correction_text.clone(),
                 state.pending_correction_snapshot.clone(),
                 state.ui_tx.clone(),
                 Arc::clone(&state.runtime),
@@ -777,11 +776,11 @@ impl Ui {
         };
 
         runtime.spawn(async move {
-            match openai::correct_transcript_text(&api_key, &terms, &original).await {
+            match openai::correct_transcript_text(&api_key, &terms, &snapshot).await {
                 Ok(corrected) => {
                     let _ = ui_tx.send(UiEvent::CorrectionReady(CorrectionResult {
                         generation,
-                        original,
+                        original: snapshot.clone(),
                         snapshot,
                         corrected,
                     }));
@@ -810,24 +809,15 @@ impl Ui {
             return;
         }
 
-        let original = result.original.trim();
         let corrected = result.corrected.trim();
-        if original.is_empty() || corrected.is_empty() || original == corrected {
+        if result.original.trim().is_empty() || corrected.is_empty() || result.original == corrected
+        {
             state.pending_correction_text.clear();
             state.pending_correction_snapshot.clear();
             return;
         }
 
-        let Some(prefix) = current.strip_suffix(original) else {
-            tracing::info!("skipping auto-correction because transcript tail no longer matches");
-            state.pending_correction_text.clear();
-            state.pending_correction_snapshot.clear();
-            return;
-        };
-
-        state
-            .transcript_buffer
-            .set_text(&format!("{prefix}{corrected}"));
+        state.transcript_buffer.set_text(corrected);
         state.pending_correction_text.clear();
         state.pending_correction_snapshot.clear();
         state.update_latest_recording_history();
