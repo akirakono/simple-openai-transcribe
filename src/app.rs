@@ -1,11 +1,14 @@
 use std::cell::RefCell;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use gtk::gio;
 use gtk::glib::{self, ControlFlow};
 use tokio::runtime::Runtime;
@@ -304,6 +307,13 @@ impl Ui {
 
         {
             let state = Rc::clone(&state);
+            action_pane.write_japanese.connect_clicked(move |_| {
+                Ui::write_japanese_note(&state);
+            });
+        }
+
+        {
+            let state = Rc::clone(&state);
             window.connect_close_request(move |_| {
                 Ui::quit(&state);
                 glib::Propagation::Stop
@@ -490,6 +500,15 @@ impl Ui {
         }
         window.add_action(&to_japanese);
 
+        let write_japanese = gio::SimpleAction::new("write-japanese-note", None);
+        {
+            let state = Rc::clone(state);
+            write_japanese.connect_activate(move |_, _| {
+                Ui::write_japanese_note(&state);
+            });
+        }
+        window.add_action(&write_japanese);
+
         let preferences = gio::SimpleAction::new("preferences", None);
         {
             let state = Rc::clone(state);
@@ -511,6 +530,7 @@ impl Ui {
         app.set_accels_for_action("win.toggle-record", &["F1", "<Primary>r"]);
         app.set_accels_for_action("win.translate-english", &["<Primary>Right"]);
         app.set_accels_for_action("win.translate-japanese", &["<Primary>Left"]);
+        app.set_accels_for_action("win.write-japanese-note", &["<Primary>s"]);
         app.set_accels_for_action("win.preferences", &["<Primary>comma"]);
         app.set_accels_for_action("win.history", &["<Primary>h"]);
         app.set_accels_for_action("win.close-window", &["Escape"]);
@@ -709,6 +729,27 @@ impl Ui {
         state.set_status("待機中", false);
     }
 
+    fn write_japanese_note(state: &Rc<RefCell<UiState>>) {
+        Ui::ensure_recording_finished(state);
+
+        let mut state = state.borrow_mut();
+        let text = buffer_text(&state.transcript_buffer);
+        if text.trim().is_empty() {
+            state.set_status("日本語テキストがありません", false);
+            return;
+        }
+
+        match append_note_text(&state.config.note_path_template, &text) {
+            Ok(path) => {
+                state.set_status("待機中", false);
+                state.show_toast(&format!("メモに書き込みました: {}", path.display()));
+            }
+            Err(error) => {
+                state.set_status(&format!("メモ書き込みに失敗: {error}"), false);
+            }
+        }
+    }
+
     fn quit(state: &Rc<RefCell<UiState>>) {
         let mut state = state.borrow_mut();
         let width = state.window.width();
@@ -866,6 +907,17 @@ impl Ui {
         terms_group.add(&terms_widget);
         page.add(&terms_group);
 
+        let note_group = adw::PreferencesGroup::builder()
+            .title("メモ書き込み")
+            .description(
+                "日本語テキストの追記先です。%{YYYYmmdd} などの日付プレースホルダが使えます。",
+            )
+            .build();
+        let (note_widget, note_buffer) =
+            preferences_editor("保存先 Path Template", &snapshot.note_path_template, 72);
+        note_group.add(&note_widget);
+        page.add(&note_group);
+
         prefs.add(&page);
 
         {
@@ -904,6 +956,16 @@ impl Ui {
                 let text = buffer_text(buffer);
                 let mut state = state.borrow_mut();
                 state.config.terms = parse_terms(&text);
+                state.persist_config();
+            });
+        }
+
+        {
+            let state = Rc::clone(state);
+            note_buffer.connect_changed(move |buffer| {
+                let text = buffer_text(buffer);
+                let mut state = state.borrow_mut();
+                state.config.note_path_template = text.trim().to_string();
                 state.persist_config();
             });
         }
@@ -1211,6 +1273,7 @@ struct TranslationActionsPane {
     container: gtk::Box,
     to_english: gtk::Button,
     to_japanese: gtk::Button,
+    write_japanese: gtk::Button,
 }
 
 fn editor_pane(title: &str, buffer: &gtk::TextBuffer, editable: bool) -> gtk::Box {
@@ -1247,14 +1310,20 @@ fn translation_actions_pane() -> TranslationActionsPane {
     to_english.set_tooltip_text(Some("日本語を英訳して右ペインへ出力 (Ctrl+Right)"));
     let to_japanese = gtk::Button::with_label("⬅ 和訳  Ctrl+Left");
     to_japanese.set_tooltip_text(Some("英語を和訳して左ペインへ出力 (Ctrl+Left)"));
+    let write_japanese = gtk::Button::with_label("メモへ書き込み  Ctrl+S");
+    write_japanese.set_tooltip_text(Some(
+        "日本語テキストを設定した Markdown ファイルへ追記 (Ctrl+S)",
+    ));
 
     container.append(&to_english);
     container.append(&to_japanese);
+    container.append(&write_japanese);
 
     TranslationActionsPane {
         container,
         to_english,
         to_japanese,
+        write_japanese,
     }
 }
 
@@ -1351,6 +1420,78 @@ fn copy_to_clipboard(clipboard: &mut Option<arboard::Clipboard>, text: &str) -> 
     clipboard
         .set_text(text.to_string())
         .context("failed to set clipboard text")
+}
+
+fn append_note_text(path_template: &str, text: &str) -> Result<PathBuf> {
+    let path = expand_note_path_template(path_template)?;
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("text is empty");
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let needs_separator = fs::metadata(&path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    if needs_separator {
+        file.write_all(b"\n\n")
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(path)
+}
+
+fn expand_note_path_template(path_template: &str) -> Result<PathBuf> {
+    let path_template = path_template.trim();
+    if path_template.is_empty() {
+        bail!("保存先 Path Template が空です");
+    }
+
+    let now = gtk::glib::DateTime::now_local().context("failed to get local date")?;
+    let mut expanded = path_template.to_string();
+    for (placeholder, format) in [
+        ("%{YYYYmmdd}", "%Y%m%d"),
+        ("%{YYYY-mm-dd}", "%Y-%m-%d"),
+        ("%{YYYYmm}", "%Y%m"),
+        ("%{YYYY-mm}", "%Y-%m"),
+        ("%{YYYY}", "%Y"),
+        ("%{mm}", "%m"),
+        ("%{dd}", "%d"),
+        ("%{HHMM}", "%H%M"),
+        ("%{HH:mm}", "%H:%M"),
+    ] {
+        if expanded.contains(placeholder) {
+            let value = now
+                .format(format)
+                .with_context(|| format!("failed to format {placeholder}"))?;
+            expanded = expanded.replace(placeholder, value.as_str());
+        }
+    }
+
+    if let Some(rest) = expanded.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Ok(PathBuf::from(home).join(rest));
+        }
+    }
+
+    Ok(PathBuf::from(expanded))
 }
 
 fn transcript_delta(before: &str, after: &str) -> String {

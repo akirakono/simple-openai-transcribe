@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub transcription_system_prompt: String,
     pub translate_to_english_prompt: String,
     pub translate_to_japanese_prompt: String,
+    #[serde(default = "default_note_path_template")]
+    pub note_path_template: String,
     pub window_width: i32,
     pub window_height: i32,
 }
@@ -35,10 +37,15 @@ impl Default for AppConfig {
             translate_to_japanese_prompt:
                 "Translate the user's English text into natural Japanese. Preserve meaning. Output only the translation."
                     .to_string(),
+            note_path_template: default_note_path_template(),
             window_width: 1100,
             window_height: 760,
         }
     }
+}
+
+fn default_note_path_template() -> String {
+    "~/Documents/daily-note-%{YYYYmmdd}.md".to_string()
 }
 
 #[derive(Debug, Clone)]

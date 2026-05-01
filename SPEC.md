@@ -156,6 +156,7 @@ daemon は改行付きのプレーンテキストで応答する。
 | `transcription_system_prompt` | `string` | `日本語の音声を自然な表記で正確に文字起こししてください。` | transcription 用 prompt |
 | `translate_to_english_prompt` | `string` | `Translate the user's Japanese text into natural English. Preserve meaning. Output only the translation.` | 日本語→英語 prompt |
 | `translate_to_japanese_prompt` | `string` | `Translate the user's English text into natural Japanese. Preserve meaning. Output only the translation.` | 英語→日本語 prompt |
+| `note_path_template` | `string` | `~/Documents/daily-note-%{YYYYmmdd}.md` | 日本語テキストの追記先 path template |
 | `window_width` | `i32` | `1100` | 前回または初期表示時の幅 |
 | `window_height` | `i32` | `760` | 前回または初期表示時の高さ |
 
@@ -211,11 +212,13 @@ API key は設定ファイルに保存してはならない。
 - 中央: 翻訳アクション
   - `英訳 ➡ Ctrl+Right`
   - `⬅ 和訳 Ctrl+Left`
+  - `メモへ書き込み Ctrl+S`
 - 右: 英語ペイン
   - 編集可能
   - 翻訳結果の表示先
 
 翻訳ボタンは各対象ペインの全文を置換する。
+メモ書き込みボタンは、日本語ペインの全文を `note_path_template` の展開先に追記する。
 
 ### 9.5 ステータス
 
@@ -238,6 +241,7 @@ API key は設定ファイルに保存してはならない。
 - 日本語→英語 prompt
 - 英語→日本語 prompt
 - 固有名詞辞書
+- メモ保存先 path template
 
 固有名詞辞書は 1 行 1 語で編集し、保存時に以下の正規化を行う。
 

@@ -105,6 +105,7 @@ cargo run -- quit
 - 中央
   - `英訳 ➡ Ctrl+Right`
   - `⬅ 和訳 Ctrl+Left`
+  - `メモへ書き込み Ctrl+S`
 - 右ペイン
   - 英語 translation
   - 編集可能
@@ -128,6 +129,8 @@ cargo run -- quit
   - 日本語を英訳
 - `Ctrl+Left`
   - 英語を和訳
+- `Ctrl+S`
+  - 日本語 transcript をメモファイルへ追記
 - `Ctrl+,`
   - 設定を開く
 - `Ctrl+H`
@@ -174,6 +177,10 @@ Ubuntu のシステムショートカットに割り当てる例:
 - 文字起こし prompt
 - 英訳 prompt
 - 和訳 prompt
+- メモ保存先 path template
+
+メモ保存先 path template のデフォルトは `~/Documents/daily-note-%{YYYYmmdd}.md` です。
+`%{YYYYmmdd}`, `%{YYYY-mm-dd}`, `%{YYYYmm}`, `%{YYYY-mm}`, `%{YYYY}`, `%{mm}`, `%{dd}`, `%{HHMM}`, `%{HH:mm}` を現在日時で展開します。
 
 ## ログと履歴
 
