@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::Sender as StdSender;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -10,22 +10,25 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::audio;
 
-const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
+const TRANSCRIPTION_MODEL: &str = "gpt-realtime-whisper";
+const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
+const REALTIME_CLIENT_SECRETS_URL: &str = "https://api.openai.com/v1/realtime/client_secrets";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const LOCAL_SPEECH_SIGNAL_INTERVAL: Duration = Duration::from_millis(250);
 const LOCAL_SPEECH_RMS_THRESHOLD: f64 = 0.015;
 const LOCAL_SPEECH_PEAK_THRESHOLD: f64 = 0.08;
+const MANUAL_COMMIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MANUAL_COMMIT_MAX_SEGMENT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
     pub api_key: String,
-    pub terms: Vec<String>,
-    pub transcription_prompt: String,
     pub vad_threshold: f32,
     pub vad_silence_ms: u32,
 }
@@ -71,9 +74,10 @@ pub async fn start_transcription(
     ui_tx: StdSender<UiEvent>,
 ) -> Result<mpsc::UnboundedSender<SessionCommand>> {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let task_command_tx = command_tx.clone();
     let task_ui_tx = ui_tx.clone();
     tokio::spawn(async move {
-        let result = run_transcription(options, task_ui_tx.clone(), command_rx).await;
+        let result = run_transcription(options, task_ui_tx.clone(), task_command_tx, command_rx).await;
         if let Err(error) = result {
             tracing::error!("transcription session failed: {error:#}");
             let _ = task_ui_tx.send(UiEvent::Error(error.to_string()));
@@ -86,57 +90,38 @@ pub async fn start_transcription(
 async fn run_transcription(
     options: SessionOptions,
     ui_tx: StdSender<UiEvent>,
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
     mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
 ) -> Result<()> {
+    let client_secret = create_transcription_client_secret(&options.api_key)
+        .await
+        .context("failed to create OpenAI Realtime transcription session")?;
     let mut request = REALTIME_URL
         .into_client_request()
         .context("invalid realtime URL")?;
     request.headers_mut().insert(
         AUTHORIZATION,
-        format!("Bearer {}", options.api_key).parse()?,
+        format!("Bearer {}", client_secret).parse()?,
     );
-    request
-        .headers_mut()
-        .insert("OpenAI-Beta", "realtime=v1".parse()?);
 
     let (ws_stream, _) = connect_async(request)
         .await
-        .context("failed to connect to OpenAI Realtime API")?;
+        .map_err(log_realtime_connect_error)?;
     let (mut write, mut read) = ws_stream.split();
-
-    let prompt = build_transcription_prompt(&options.transcription_prompt, &options.terms);
-    let threshold = normalize_vad_threshold(options.vad_threshold);
-    let session_update = json!({
-        "type": "transcription_session.update",
-        "session": {
-            "input_audio_format": "pcm16",
-            "input_audio_noise_reduction": { "type": "near_field" },
-            "input_audio_transcription": {
-                "model": "gpt-4o-transcribe",
-                "language": "ja",
-                "prompt": prompt
-            },
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": threshold,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": options.vad_silence_ms
-            },
-            "include": ["item.input_audio_transcription.logprobs"]
-        }
-    });
-    write
-        .send(Message::Text(session_update.to_string().into()))
-        .await
-        .context("failed to send transcription_session.update")?;
 
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
     let capture = audio::start_capture(audio_tx).await?;
     let mut capture = Some(capture);
+    let _ = ui_tx.send(UiEvent::RecordingStarted(command_tx));
     let _ = ui_tx.send(UiEvent::Status("録音中".to_string()));
     let mut assembler = TranscriptAssembler::default();
     let mut pending_audio_bytes = 0_usize;
     let mut last_local_speech_signal = None;
+    let mut last_local_speech_at = None;
+    let mut buffered_audio_since = None;
+    let mut commit_in_flight = false;
+    let mut manual_commit_tick = tokio::time::interval(MANUAL_COMMIT_POLL_INTERVAL);
+    manual_commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut finish_deadline: Option<Instant> = None;
 
@@ -149,10 +134,14 @@ async fn run_transcription(
                             if let Some(capture) = capture.take() {
                                 capture.stop().await;
                             }
+                            if pending_audio_bytes > 0 && !commit_in_flight {
+                                send_audio_commit(&mut write).await?;
+                                commit_in_flight = true;
+                            }
                             tracing::info!(
-                                "finish requested; stopping capture with {pending_audio_bytes} locally buffered bytes and waiting for server_vad to settle"
+                                "finish requested; stopping capture with {pending_audio_bytes} locally buffered bytes and waiting for manual commit to settle"
                             );
-                            let settle_ms = (options.vad_silence_ms + 400).max(1_200) as u64;
+                            let settle_ms = (options.vad_silence_ms + 600).max(1_500) as u64;
                             finish_deadline = Some(Instant::now() + Duration::from_millis(settle_ms));
                             let _ = ui_tx.send(UiEvent::Status("最終結果を待っています".to_string()));
                         }
@@ -166,11 +155,15 @@ async fn run_transcription(
                 }
             }
             Some(chunk) = audio_rx.recv(), if finish_deadline.is_none() => {
+                if pending_audio_bytes == 0 {
+                    buffered_audio_since = Some(Instant::now());
+                }
                 pending_audio_bytes += chunk.len();
-                if chunk_has_local_speech(&chunk)
-                    && should_emit_local_speech_signal(&mut last_local_speech_signal)
-                {
-                    let _ = ui_tx.send(UiEvent::LocalSpeechDetected);
+                if chunk_has_local_speech(&chunk, options.vad_threshold) {
+                    last_local_speech_at = Some(Instant::now());
+                    if should_emit_local_speech_signal(&mut last_local_speech_signal) {
+                        let _ = ui_tx.send(UiEvent::LocalSpeechDetected);
+                    }
                 }
                 let append = json!({
                     "type": "input_audio_buffer.append",
@@ -186,6 +179,9 @@ async fn run_transcription(
                     Some(Ok(Message::Text(text))) => {
                         if event_type(&text).as_deref() == Some("input_audio_buffer.committed") {
                             pending_audio_bytes = 0;
+                            last_local_speech_at = None;
+                            buffered_audio_since = None;
+                            commit_in_flight = false;
                         }
                         handle_realtime_event(&text, &mut assembler, &ui_tx);
                     }
@@ -198,6 +194,18 @@ async fn run_transcription(
                         return Err(error).context("realtime websocket read failed");
                     }
                     None => break,
+                }
+            }
+            _ = manual_commit_tick.tick(), if finish_deadline.is_none() => {
+                if should_send_manual_commit(
+                    pending_audio_bytes,
+                    commit_in_flight,
+                    buffered_audio_since,
+                    last_local_speech_at,
+                    Duration::from_millis(options.vad_silence_ms as u64),
+                ) {
+                    send_audio_commit(&mut write).await?;
+                    commit_in_flight = true;
                 }
             }
             _ = async {
@@ -225,6 +233,114 @@ async fn run_transcription(
     let _ = ui_tx.send(UiEvent::RecordingFinished);
     Ok(())
 }
+
+async fn create_transcription_client_secret(api_key: &str) -> Result<String> {
+    let response = reqwest::Client::new()
+        .post(REALTIME_CLIENT_SECRETS_URL)
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "session": {
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": 24000,
+                        },
+                        "noise_reduction": { "type": "near_field" },
+                        "transcription": {
+                            "model": TRANSCRIPTION_MODEL,
+                            "language": "ja",
+                            "delay": "low"
+                        },
+                        "turn_detection": null
+                    }
+                },
+                "include": ["item.input_audio_transcription.logprobs"]
+            }
+        }))
+        .send()
+        .await
+        .context("failed to call realtime client_secrets")?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read realtime client_secrets response body")?;
+
+    if !status.is_success() {
+        let body = truncate_for_log(&body, 2_000);
+        tracing::error!(
+            "failed to create OpenAI Realtime client secret: status={} body={}",
+            status,
+            body
+        );
+        return Err(anyhow!(
+            "failed to create OpenAI Realtime transcription session: HTTP error: {}",
+            status
+        ));
+    }
+
+    let value: Value = serde_json::from_str(&body)
+        .context("failed to parse realtime client_secrets response JSON")?;
+    value
+        .get("value")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .context("realtime client_secrets response did not contain value")
+}
+
+fn log_realtime_connect_error(error: WsError) -> anyhow::Error {
+    match error {
+        WsError::Http(response) => {
+            let status = response.status();
+            log_realtime_http_response(&response);
+            anyhow!("failed to connect to OpenAI Realtime API: HTTP error: {status}")
+        }
+        other => anyhow!(other).context("failed to connect to OpenAI Realtime API"),
+    }
+}
+
+fn log_realtime_http_response(response: &tokio_tungstenite::tungstenite::handshake::client::Response) {
+    let status = response.status();
+    let headers = format!("{:?}", response.headers());
+    let body = response
+        .body()
+        .as_ref()
+        .map(|body| truncate_for_log(&String::from_utf8_lossy(body), 2_000))
+        .unwrap_or_else(|| "<empty>".to_string());
+
+    tracing::error!(
+        "failed to connect to OpenAI Realtime API: status={} headers={} body={}",
+        status,
+        headers,
+        body
+    );
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+async fn send_audio_commit<S>(write: &mut S) -> Result<()>
+where
+    S: futures_util::Sink<Message, Error = WsError> + Unpin,
+{
+    let commit = json!({
+        "type": "input_audio_buffer.commit",
+    });
+    write
+        .send(Message::Text(commit.to_string().into()))
+        .await
+        .context("failed to send input_audio_buffer.commit")
+}
+
 
 fn handle_realtime_event(
     text: &str,
@@ -319,7 +435,7 @@ fn should_emit_local_speech_signal(last_signal: &mut Option<Instant>) -> bool {
     true
 }
 
-fn chunk_has_local_speech(chunk: &[u8]) -> bool {
+fn chunk_has_local_speech(chunk: &[u8], vad_threshold: f32) -> bool {
     let mut sum_squares = 0.0_f64;
     let mut sample_count = 0_u32;
     let mut peak = 0.0_f64;
@@ -337,7 +453,30 @@ fn chunk_has_local_speech(chunk: &[u8]) -> bool {
     }
 
     let rms = (sum_squares / sample_count as f64).sqrt();
-    rms >= LOCAL_SPEECH_RMS_THRESHOLD || peak >= LOCAL_SPEECH_PEAK_THRESHOLD
+    let sensitivity = vad_threshold.clamp(0.0, 1.0) as f64;
+    let rms_threshold = 0.008 + (1.0 - sensitivity) * 0.02;
+    let peak_threshold = 0.04 + (1.0 - sensitivity) * 0.12;
+    rms >= rms_threshold.max(LOCAL_SPEECH_RMS_THRESHOLD * 0.5)
+        || peak >= peak_threshold.max(LOCAL_SPEECH_PEAK_THRESHOLD * 0.5)
+}
+
+fn should_send_manual_commit(
+    pending_audio_bytes: usize,
+    commit_in_flight: bool,
+    buffered_audio_since: Option<Instant>,
+    last_local_speech_at: Option<Instant>,
+    silence_threshold: Duration,
+) -> bool {
+    if pending_audio_bytes == 0 || commit_in_flight {
+        return false;
+    }
+
+    if buffered_audio_since.is_some_and(|instant| instant.elapsed() >= MANUAL_COMMIT_MAX_SEGMENT) {
+        return true;
+    }
+
+    last_local_speech_at
+        .is_some_and(|instant| instant.elapsed() >= silence_threshold.max(Duration::from_millis(300)))
 }
 
 pub async fn translate_text(api_key: &str, text: &str, instructions: &str) -> Result<String> {
@@ -371,11 +510,12 @@ pub async fn translate_text(api_key: &str, text: &str, instructions: &str) -> Re
 
 pub async fn correct_transcript_text(
     api_key: &str,
+    transcription_prompt: &str,
     terms: &[String],
     text: &str,
 ) -> Result<String> {
     let client = reqwest::Client::new();
-    let system_prompt = build_correction_prompt(terms);
+    let system_prompt = build_correction_prompt(transcription_prompt, terms);
     let response = client
         .post(RESPONSES_URL)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
@@ -426,32 +566,16 @@ fn extract_output_text(value: &Value) -> Option<String> {
     }
 }
 
-pub fn build_transcription_prompt(base_prompt: &str, terms: &[String]) -> String {
-    let mut prompt = base_prompt.trim().to_string();
-    if prompt.is_empty() {
-        prompt = "日本語の音声を自然な表記で正確に文字起こししてください。".to_string();
-    }
-
-    if terms.is_empty() {
-        return prompt;
-    }
-
-    if !prompt.ends_with('\n') {
-        prompt.push('\n');
-    }
-    prompt.push_str("以下の語を優先して正確に認識してください:\n");
-    for term in terms {
-        prompt.push_str("- ");
-        prompt.push_str(term);
-        prompt.push('\n');
-    }
-    prompt
-}
-
-pub fn build_correction_prompt(terms: &[String]) -> String {
+pub fn build_correction_prompt(transcription_prompt: &str, terms: &[String]) -> String {
     let mut prompt = String::from(
         "You correct Japanese speech transcripts. Fix misspellings, punctuation, spacing, and capitalization only when needed. Preserve meaning. Do not summarize. Do not add facts. Return only the corrected transcript text.",
     );
+
+    let transcription_prompt = transcription_prompt.trim();
+    if !transcription_prompt.is_empty() {
+        prompt.push_str("\nFollow this transcription guidance when choosing spellings and formatting:\n");
+        prompt.push_str(transcription_prompt);
+    }
 
     if !terms.is_empty() {
         prompt.push_str("\nPrefer these spellings exactly:\n");
@@ -463,11 +587,6 @@ pub fn build_correction_prompt(terms: &[String]) -> String {
     }
 
     prompt
-}
-
-fn normalize_vad_threshold(value: f32) -> f64 {
-    let clamped = value.clamp(0.0, 1.0) as f64;
-    (clamped * 1_000_000_000_000_000_f64).round() / 1_000_000_000_000_000_f64
 }
 
 #[derive(Debug, Default)]
@@ -598,18 +717,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_includes_terms() {
-        let prompt = build_transcription_prompt(
-            "日本語の音声を自然な表記で正確に文字起こししてください。",
-            &["OpenAI".to_string(), "Ubuntu".to_string()],
-        );
-        assert!(prompt.contains("OpenAI"));
-        assert!(prompt.contains("Ubuntu"));
-    }
-
-    #[test]
     fn correction_prompt_includes_terms() {
-        let prompt = build_correction_prompt(&["OpenAI".to_string(), "Q.U.A.R.T.Z.".to_string()]);
+        let prompt = build_correction_prompt(
+            "日本語の音声を自然な表記で正確に文字起こししてください。",
+            &["OpenAI".to_string(), "Q.U.A.R.T.Z.".to_string()],
+        );
+        assert!(prompt.contains("自然な表記"));
         assert!(prompt.contains("OpenAI"));
         assert!(prompt.contains("Q.U.A.R.T.Z."));
     }
@@ -630,18 +743,36 @@ mod tests {
     }
 
     #[test]
-    fn vad_threshold_serialization_stays_within_limit() {
-        let value = normalize_vad_threshold(0.45000002_f32);
-        let rendered = serde_json::to_string(&json!({ "threshold": value })).unwrap();
-        let decimals = rendered
-            .split(':')
-            .nth(1)
-            .unwrap()
-            .trim_end_matches('}')
-            .split('.')
-            .nth(1)
-            .unwrap();
-        assert!(decimals.len() <= 16);
+    fn manual_commit_triggers_after_silence() {
+        assert!(should_send_manual_commit(
+            960,
+            false,
+            Some(Instant::now()),
+            Some(Instant::now() - Duration::from_millis(800)),
+            Duration::from_millis(500),
+        ));
+    }
+
+    #[test]
+    fn manual_commit_triggers_after_max_segment_without_silence() {
+        assert!(should_send_manual_commit(
+            960,
+            false,
+            Some(Instant::now() - MANUAL_COMMIT_MAX_SEGMENT - Duration::from_millis(1)),
+            Some(Instant::now()),
+            Duration::from_millis(500),
+        ));
+    }
+
+    #[test]
+    fn manual_commit_waits_while_commit_is_in_flight() {
+        assert!(!should_send_manual_commit(
+            960,
+            true,
+            Some(Instant::now() - MANUAL_COMMIT_MAX_SEGMENT - Duration::from_millis(1)),
+            Some(Instant::now() - Duration::from_millis(800)),
+            Duration::from_millis(500),
+        ));
     }
 
     #[test]
@@ -654,7 +785,7 @@ mod tests {
 
     #[test]
     fn local_speech_detector_ignores_silence() {
-        assert!(!chunk_has_local_speech(&[0; 960]));
+        assert!(!chunk_has_local_speech(&[0; 960], 0.45));
     }
 
     #[test]
@@ -663,6 +794,6 @@ mod tests {
         for _ in 0..480 {
             chunk.extend_from_slice(&1200_i16.to_le_bytes());
         }
-        assert!(chunk_has_local_speech(&chunk));
+        assert!(chunk_has_local_speech(&chunk, 0.45));
     }
 }

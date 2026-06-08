@@ -116,6 +116,7 @@ struct UiState {
     active_recording_history: Option<RecordingHistoryContext>,
     latest_recording_history: Option<FinishedRecordingHistory>,
     finish_requested: bool,
+    finalization_pending: bool,
     last_transcription_activity: Option<Instant>,
     last_local_speech_activity: Option<Instant>,
     waiting_for_transcription_since: Option<Instant>,
@@ -262,6 +263,7 @@ impl Ui {
             active_recording_history: None,
             latest_recording_history: None,
             finish_requested: false,
+            finalization_pending: false,
             last_transcription_activity: None,
             last_local_speech_activity: None,
             waiting_for_transcription_since: None,
@@ -404,12 +406,17 @@ impl Ui {
                         }
                         UiEvent::CorrectionReady(result) => {
                             Ui::apply_correction(&state, result);
+                            Ui::finalize_recording_if_ready(&state);
                         }
                         UiEvent::CorrectionFailed(generation) => {
-                            let mut state = state.borrow_mut();
-                            if generation == state.correction_generation {
-                                state.correction_in_flight = false;
+                            let mut state_mut = state.borrow_mut();
+                            if generation == state_mut.correction_generation {
+                                state_mut.correction_in_flight = false;
+                                state_mut.pending_correction_text.clear();
+                                state_mut.pending_correction_snapshot.clear();
                             }
+                            drop(state_mut);
+                            Ui::finalize_recording_if_ready(&state);
                         }
                         UiEvent::TranslationStarted(target) => {
                             let label = match target {
@@ -430,29 +437,20 @@ impl Ui {
                             state.set_status("録音中", true);
                         }
                         UiEvent::RecordingFinished => {
-                            let mut state = state.borrow_mut();
-                            state.active_session = None;
-                            state.finish_requested = false;
-                            state.last_transcription_activity = None;
-                            state.reset_local_speech_state();
-                            state.set_recording_active(false);
-                            state.set_status("待機中", false);
-                            state.persist_transcription_history();
-                            if state.config.copy_on_finish {
-                                let text = buffer_text(&state.transcript_buffer);
-                                if !text.trim().is_empty() {
-                                    if let Err(error) =
-                                        copy_to_clipboard(&mut state.clipboard, &text)
-                                    {
-                                        state.set_status(
-                                            &format!("clipboard へのコピーに失敗: {error}"),
-                                            false,
-                                        );
-                                    } else {
-                                        state.show_toast("文字起こしをコピーしました");
-                                    }
-                                }
+                            let mut state_mut = state.borrow_mut();
+                            let had_active_session = state_mut.active_session.is_some();
+                            state_mut.active_session = None;
+                            state_mut.finish_requested = false;
+                            state_mut.finalization_pending = had_active_session;
+                            state_mut.last_transcription_activity = None;
+                            state_mut.reset_local_speech_state();
+                            state_mut.set_recording_active(false);
+                            if !had_active_session {
+                                state_mut.active_recording_history = None;
+                                state_mut.latest_recording_history = None;
                             }
+                            drop(state_mut);
+                            Ui::finalize_recording_if_ready(&state);
                         }
                         UiEvent::Error(error) => {
                             tracing::error!("ui error: {error}");
@@ -569,6 +567,7 @@ impl Ui {
         state_mut.pending_correction_snapshot.clear();
         state_mut.latest_recording_history = None;
         state_mut.finish_requested = false;
+        state_mut.finalization_pending = false;
         state_mut.last_transcription_activity = Some(Instant::now());
         state_mut.reset_local_speech_state();
         state_mut.active_recording_history = Some(RecordingHistoryContext {
@@ -577,22 +576,18 @@ impl Ui {
 
         let options = SessionOptions {
             api_key: state_mut.api_key.clone(),
-            terms: state_mut.config.terms.clone(),
-            transcription_prompt: state_mut.config.transcription_system_prompt.clone(),
             vad_threshold: state_mut.config.vad_threshold,
             vad_silence_ms: state_mut.config.vad_silence_ms,
         };
 
         let ui_tx = state_mut.ui_tx.clone();
         let runtime = Arc::clone(&state_mut.runtime);
-        state_mut.set_status("録音中", true);
+        state_mut.set_status("OpenAI に接続中", true);
         drop(state_mut);
 
         runtime.spawn(async move {
             match openai::start_transcription(options, ui_tx.clone()).await {
-                Ok(session_tx) => {
-                    let _ = ui_tx.send(UiEvent::RecordingStarted(session_tx));
-                }
+                Ok(_session_tx) => {}
                 Err(error) => {
                     tracing::error!("failed to start transcription task: {error:#}");
                     let _ = ui_tx.send(UiEvent::Error(error.to_string()));
@@ -797,7 +792,7 @@ impl Ui {
     }
 
     fn run_correction_if_due(state: &Rc<RefCell<UiState>>, generation: u64) {
-        let (api_key, terms, snapshot, ui_tx, runtime) = {
+        let (api_key, transcription_prompt, terms, snapshot, ui_tx, runtime) = {
             let mut state = state.borrow_mut();
             if generation != state.correction_generation
                 || state.correction_in_flight
@@ -809,6 +804,7 @@ impl Ui {
             state.correction_in_flight = true;
             (
                 state.api_key.clone(),
+                state.config.transcription_system_prompt.clone(),
                 state.config.terms.clone(),
                 state.pending_correction_snapshot.clone(),
                 state.ui_tx.clone(),
@@ -817,7 +813,14 @@ impl Ui {
         };
 
         runtime.spawn(async move {
-            match openai::correct_transcript_text(&api_key, &terms, &snapshot).await {
+            match openai::correct_transcript_text(
+                &api_key,
+                &transcription_prompt,
+                &terms,
+                &snapshot,
+            )
+            .await
+            {
                 Ok(corrected) => {
                     let _ = ui_tx.send(UiEvent::CorrectionReady(CorrectionResult {
                         generation,
@@ -862,6 +865,50 @@ impl Ui {
         state.pending_correction_text.clear();
         state.pending_correction_snapshot.clear();
         state.update_latest_recording_history();
+    }
+
+    fn finalize_recording_if_ready(state: &Rc<RefCell<UiState>>) {
+        let action = {
+            let state = state.borrow();
+            if !state.finalization_pending {
+                return;
+            }
+            if state.active_session.is_some() {
+                return;
+            }
+            if state.correction_in_flight {
+                return;
+            }
+            if !state.pending_correction_text.trim().is_empty() {
+                Some(state.correction_generation)
+            } else {
+                None
+            }
+        };
+
+        if let Some(generation) = action {
+            state.borrow_mut().set_status("文字起こし整形中", true);
+            Ui::run_correction_if_due(state, generation);
+            return;
+        }
+
+        let mut state = state.borrow_mut();
+        if !state.finalization_pending {
+            return;
+        }
+        state.finalization_pending = false;
+        state.set_status("待機中", false);
+        state.persist_transcription_history();
+        if state.config.copy_on_finish {
+            let text = buffer_text(&state.transcript_buffer);
+            if !text.trim().is_empty() {
+                if let Err(error) = copy_to_clipboard(&mut state.clipboard, &text) {
+                    state.set_status(&format!("clipboard へのコピーに失敗: {error}"), false);
+                } else {
+                    state.show_toast("文字起こしをコピーしました");
+                }
+            }
+        }
     }
 
     fn show_preferences(state: &Rc<RefCell<UiState>>) {

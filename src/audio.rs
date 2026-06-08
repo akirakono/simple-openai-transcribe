@@ -1,7 +1,7 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -10,6 +10,7 @@ pub type AudioChunk = Vec<u8>;
 pub struct AudioCapture {
     child: tokio::process::Child,
     pump_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
 }
 
 pub async fn start_capture(tx: mpsc::UnboundedSender<AudioChunk>) -> Result<AudioCapture> {
@@ -21,7 +22,7 @@ pub async fn start_capture(tx: mpsc::UnboundedSender<AudioChunk>) -> Result<Audi
         .arg("-")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("failed to start pw-record")?;
 
@@ -29,6 +30,10 @@ pub async fn start_capture(tx: mpsc::UnboundedSender<AudioChunk>) -> Result<Audi
         .stdout
         .take()
         .context("failed to capture pw-record stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture pw-record stderr")?;
     let pump_task = tokio::spawn(async move {
         const CHUNK_BYTES: usize = 960;
         let mut buffer = vec![0_u8; CHUNK_BYTES];
@@ -47,8 +52,25 @@ pub async fn start_capture(tx: mpsc::UnboundedSender<AudioChunk>) -> Result<Audi
             }
         }
     });
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        loop {
+            match stderr_lines.next_line().await {
+                Ok(Some(line)) => tracing::warn!("pw-record: {line}"),
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!("failed to read pw-record stderr: {error}");
+                    break;
+                }
+            }
+        }
+    });
 
-    Ok(AudioCapture { child, pump_task })
+    Ok(AudioCapture {
+        child,
+        pump_task,
+        stderr_task,
+    })
 }
 
 impl AudioCapture {
@@ -56,5 +78,6 @@ impl AudioCapture {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
         self.pump_task.abort();
+        self.stderr_task.abort();
     }
 }
